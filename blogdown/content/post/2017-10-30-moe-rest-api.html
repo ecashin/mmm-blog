@@ -1,0 +1,324 @@
+---
+title: "MOE Multivariate Optimization via REST"
+author: "Ed Cashin"
+date: 2017-10-30T20:52:00-05:00
+categories: ["Machine Learning"]
+tags: ["Gaussian Processes", "Bayesian", "Optimization", "hyperparameters"]
+---
+
+
+
+<div id="using-moe-to-optimize-in-two-dimensions" class="section level1">
+<h1>Using MOE to Optimize in Two Dimensions</h1>
+<p>Have you ever suddenly realized that you’ve spent more time than you planned tweaking the hyperparameters of a complex neural network? Wouldn’t it be nice to let software figure it out? Not just with an exhaustive grid search, but in a smart way.</p>
+<p>It has been done.</p>
+<p>I noticed a great blog post on a subject I’ve been meaning to get around to ever since Ryan Adams mentioned it on the Talking Machines podcast. I can’t find the episode right now, so here’s a paper: <a href="https://arxiv.org/pdf/1206.2944.pdf">Practical Bayesian Optimization of Machine Learning Algorithms</a>.</p>
+<p>The blog post is here: <a href="http://betatim.github.io/posts/bayesian-hyperparameter-search/">Bayesian optimisation for smart hyperparameter search</a>, by Tim Head, 2015.</p>
+<p>It’s a great post. It explains how Gaussian Processes are good at guiding the search through the space of hyperparameter settings. But while it uses a Python package called <a href="http://dan.iel.fm/george/current/">george</a>, it recommends another package for production use, namely <a href="https://github.com/Yelp/MOE">MOE</a>.</p>
+<p>I wanted to use MOE, but it recommended docker, and I hadn’t yet decided to drink that Koolaid. Recently I consumed a few pitchers of docker Koolaid, though, so I ran the MOE docker container and had a REST server on localhost port 6543.</p>
+<pre><code>sudo docker pull yelpmoe/latest
+sudo docker run -p 6543:6543 yelpmoe/latest</code></pre>
+<div id="pretty-endpoints" class="section level2">
+<h2>Pretty Endpoints</h2>
+<p>MOE has a C++-based optimizer that is exposed via a Python-based REST API server. The API comes with an interesting feature, pretty endpoints. If there’s an endpoint, <code>/foo</code>, then you can visit <code>/foo/pretty</code> in your web browser and see an interactive example. The page has example JSON that you can submit, edit, and resubmit.</p>
+<p>It’s pretty cool, but it left me wishing for a more traditional API reference when I wanted to go from a one-dimensional search to a two-dimensional search.</p>
+<p>The REST client that comes with MOE is pretty well documented, so I ran another copy of the MOE container.</p>
+<pre><code>sudo docker run -it -u root -v ~/experimental/moe-user:/mnt --entrypoint=/bin/bash yelpmoe/latest</code></pre>
+<p>In there, I hacked the Python REST client to log its JSON messages to a file in <code>/tmp</code> and examined that when running <a href="https://github.com/Yelp/MOE/blob/master/moe_examples/next_point_via_simple_endpoint.py">the example 2D search that comes with MOE</a>. Then I saw the format I had to use.</p>
+<pre><code>{&quot;domain_info&quot;: {&quot;dim&quot;: 2, &quot;domain_bounds&quot;: [{&quot;max&quot;: 5.0, &quot;min&quot;: -5.0}, {&quot;max&quot;: 5.0, &quot;min&quot;: -5.0}]}, &quot;gp_historical_info&quot;: {&quot;points_sampled&quot;: []}, &quot;num_to_sample&quot;: 1}</code></pre>
+<p>I already guessed that you have to say that <code>&quot;dim&quot;</code> is <code>2</code>, but I noticed that you also have to provide a min and max pair for each dimension.</p>
+</div>
+<div id="something-to-optimize" class="section level2">
+<h2>Something to Optimize</h2>
+<p>I wanted to have a function with local minima and a global minimum, so I added a cosine to a parabola.</p>
+<pre class="r"><code>library(ggplot2)
+
+true.fn &lt;- function(x) {
+    d &lt;- sqrt(sum(x^2))
+    y1 &lt;- d^2 / 100
+    y2 &lt;- cos(d) / -4
+    (y1 + y2)
+}
+
+grid &lt;- function(x, y) {
+    m &lt;- matrix(nrow=length(x) * length(y), ncol=2)
+    rowi &lt;- 1
+    for (i in 1:length(x)) {
+        for (j in 1:length(y)) {
+            m[rowi,] &lt;- c(x[i], y[j])
+            rowi &lt;- rowi + 1
+        }
+    }
+    m
+}
+
+domain &lt;- function() {
+    x &lt;- seq(-20, 20, by=0.5)
+    y &lt;- x
+    grid(x, y)
+}
+
+mk.data &lt;- function() {
+    m &lt;- domain()
+    m &lt;- cbind(m, apply(m, 1, true.fn))
+    colnames(m) &lt;- c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)
+    data.frame(m)
+}
+
+show &lt;- function() {
+    ggplot(mk.data(), aes(x=x, y=y, z=z)) + geom_contour()
+}
+
+show.x &lt;- function() {
+    d &lt;- mk.data()
+    ggplot(d[d$y == 0,], aes(x=x, y=z)) + geom_line()
+}
+
+show.x()</code></pre>
+<p><img src="/e/mmm3-blog/post/2017-10-30-moe-rest-api_files/figure-html/unnamed-chunk-1-1.png" width="672" /></p>
+<p>It’s easier to see in one dimension, but it’s a two-dimensional function.</p>
+<pre class="r"><code>show()</code></pre>
+<p><img src="/e/mmm3-blog/post/2017-10-30-moe-rest-api_files/figure-html/unnamed-chunk-2-1.png" width="672" /></p>
+</div>
+<div id="any-client" class="section level2">
+<h2>Any Client</h2>
+<p>Now I wanted to try out MOE from Python but without using their Python library. It sounds odd, but consider that 1) I might want to use some other language, maybe one that isn’t out yet, and 2) I have been using Python 3 preferentially, and their Python REST client libraries seem more comfortable with Python 2.7.</p>
+<p>Here’s the code that uses JSON directly.</p>
+<pre><code>#! /usr/bin/env python2.7
+
+from __future__ import print_function
+
+import json
+import math
+import os
+import requests
+
+from addict import Dict
+import click
+import numpy as np
+
+
+API = &#39;http://localhost:6543/gp/next_points/epi&#39;
+
+
+def true_fn(point):
+    d = np.sqrt(
+        pow(np.array(point, dtype=np.float32), 2).sum())
+    y1 = pow(d, 2) / 100
+    y2 = math.cos(d) / -4
+    return y1 + y2
+
+
+@click.option(
+    &#39;--max-iter&#39;, default=3
+)
+@click.option(
+    &#39;--verbose&#39;, default=False, is_flag=True
+)
+@click.command()
+def main(max_iter, verbose):
+    exp = Dict({
+        &quot;domain_info&quot;: {
+            &quot;dim&quot;: 2,
+            &quot;domain_bounds&quot;: [
+                {&quot;max&quot;: 20.0, &quot;min&quot;: -20.0},
+                {&quot;max&quot;: 20.0, &quot;min&quot;: -20.0},
+            ]
+        },
+        &quot;gp_historical_info&quot;: {
+            &quot;points_sampled&quot;: [],
+        },
+        &quot;num_to_sample&quot;: 1,
+    })
+    best_point = None
+    best_val = None
+    for i in range(max_iter):
+        if verbose:
+            print(json.dumps(exp))
+        r = requests.post(API, data=json.dumps(exp))
+        if verbose:
+            print(r.text)
+        nextpt = [float(i)
+                  for i in json.loads(
+                          r.text)[&#39;points_to_sample&#39;][0]]
+        val = true_fn(nextpt)
+
+        s = &#39;&#39;
+        if best_point is None or val &lt; best_val:
+            best_point = nextpt
+            best_val = val
+            s = &#39;  ... A WORLD RECORD!!!&#39;
+
+        print(&#39;f({}) = {}{}&#39;.format(nextpt, val, s))
+
+        exp.gp_historical_info.points_sampled.append({
+            &quot;value_var&quot;: 0.01,
+            &quot;value&quot;: val,
+            &quot;point&quot;: nextpt,
+        })
+
+
+if __name__ == &#39;__main__&#39;:
+    main()</code></pre>
+<p>Yeah, yeah. I know—I used Python 2.7 right after I said I prefer Python 3. Call me a hypocrite. The point is that anything can print JSON.</p>
+<p>The output looks something like this:</p>
+<pre><code>ecashin@montgomery:~/experimental/moe-user$ ./useapi_2d.py --max-iter 20
+f([-19.4211329705, 16.1817903783]) = 6.14297928492  ... A WORLD RECORD!!!
+f([-10.1536519406, -14.1447713031]) = 2.99854690833  ... A WORLD RECORD!!!
+f([-4.08891069113, -7.77026636892]) = 0.970837639895  ... A WORLD RECORD!!!
+f([7.89655712959, -16.2536583322]) = 3.0875048342
+f([0.557183035696, 0.089724831252]) = -0.208047592448  ... A WORLD RECORD!!!
+f([-1.17069715023, 0.183623456291]) = -0.0800293795817
+f([-0.0212410306582, -1.56499600174]) = 0.023082594082
+f([0.225741656362, 1.78274736612]) = 0.0883571884112
+f([2.30178362082, 0.260580016253]) = 0.223280866099
+f([-3.75559521582, -1.26936274927]) = 0.327215201349
+f([1.07484307288, 13.7023252526]) = 1.79340747812
+f([12.1463972019, 12.6231103474]) = 3.0095546387
+f([19.2194897527, 3.76973996397]) = 3.65073229955
+f([18.9615251931, -12.2498296432]) = 5.30466432742
+f([-13.0612450007, 5.59698062173]) = 2.03739960908
+f([-8.39848964969, 14.0978753142]) = 2.88374592401
+f([-18.7357357443, -11.5192903881]) = 5.08721754187
+f([17.4818277491, 19.9567035878]) = 6.99587824901
+f([-2.03383613494, -18.024251427]) = 3.1006606068
+f([7.36148447862, -7.24269082653]) = 1.2214368028
+ecashin@montgomery:~/experimental/moe-user$ </code></pre>
+<p>If I increase the number of iterations, I can see that MOE jumps around a lot in the little box from <span class="math inline">\((-20, -20)\)</span> to <span class="math inline">\((20, 20)\)</span>. It quickly finds some pretty good points but then spends a lot of time trying different combinations of coordinates.</p>
+<p>If I change the output to CSV, I can plot the search by using <a href="https://github.com/dgrtwo/gganimate"><code>gganimate</code></a> for the first time ever.</p>
+<pre class="r"><code>library(dplyr)
+## 
+## Attaching package: &#39;dplyr&#39;
+## The following objects are masked from &#39;package:stats&#39;:
+## 
+##     filter, lag
+## The following objects are masked from &#39;package:base&#39;:
+## 
+##     intersect, setdiff, setequal, union
+library(ggplot2)
+library(gganimate)
+
+d &lt;- read.csv(&#39;search.csv&#39;, header=TRUE)
+p &lt;- ggplot(d, aes(x=x1, y=x2, frame=iter, label=iter, cumulative=TRUE)) +
+  geom_text()</code></pre>
+<p>Then I call <code>gganimate()</code> to get the gif below.</p>
+<div class="figure">
+<img src="../../../../images/file47c432a8271e.gif" alt="search sequence" />
+<p class="caption">search sequence</p>
+</div>
+<p>I think that it has to explore all the gaps because I intentionally made the search hard.</p>
+</div>
+<div id="easier-optimization" class="section level2">
+<h2>Easier Optimization</h2>
+<p>If I modify the true function to remove the bumps, leaving only a parabola, the optimizer has an easier job to do.</p>
+<pre><code>def true_fn(point):
+    d = np.sqrt(
+        pow(np.array(point, dtype=np.float32), 2).sum())
+    y1 = pow(d, 2) / 100
+    # y2 = math.cos(d) / -4
+    return y1 #  + y2</code></pre>
+<p>Running the optimizer one hundred times, I get <code>search-easy.csv</code>, and I recreate the <code>gganimate</code> plot below.</p>
+<div class="figure">
+<img src="../../../../images/file47c47040b9e.gif" alt="easier search sequence" />
+<p class="caption">easier search sequence</p>
+</div>
+<p>It looks like it still doesn’t trust the easy answer. If it was just descending the gradient it would just shoot right on down the hill to the origin, but it’s skeptical, like it doesn’t want to miss a little unexpected minimum in a less well expored part of the manifold.</p>
+</div>
+<div id="scaling-up" class="section level2">
+<h2>Scaling Up</h2>
+<p>The whole point is that the function is expensive to evaluate, so it isn’t that big a deal if there’s some latency going through REST. Still, I want to get some idea of how many dimensions I can expect to use with a “reasonable” query time, and how many points I can add before things get unwieldy.</p>
+<p>I go to 100 points for each of 4, 8, 16, <span class="math inline">\(...\)</span>, 512 dimensions. For each iteration, a point is added to the historical information, and the query time in milliseconds is reporting.</p>
+<p>The plot below is surprising. Four dimensions is very slow (as was two); however, higher numbers of dimensions enjoy quicker queries. Maybe MOE switches strategies for higher numbers of dimensions.</p>
+<pre class="r"><code>d &lt;- read.csv(&quot;scale-up.csv&quot;, header=TRUE) %&gt;% mutate(ndim=factor(ndim))
+ggplot(d, aes(x=iter, y=query_msecs, color=ndim)) + geom_point()</code></pre>
+<p><img src="/e/mmm3-blog/post/2017-10-30-moe-rest-api_files/figure-html/unnamed-chunk-4-1.png" width="672" /></p>
+<p>The final version of the Python script is shown below.</p>
+<pre><code>#! /usr/bin/env python2.7
+
+from __future__ import print_function
+
+import json
+import math
+import os
+import requests
+import time
+
+from addict import Dict
+import click
+import numpy as np
+
+
+API = &#39;http://localhost:6543/gp/next_points/epi&#39;
+
+
+def true_fn(point):
+    d = np.sqrt(
+        pow(np.array(point, dtype=np.float32), 2).sum())
+    y1 = pow(d, 2) / 100
+    y2 = math.cos(d) / -4
+    return y1 + y2
+
+
+@click.option(
+    &#39;--max-iter&#39;, default=3
+)
+@click.option(
+    &#39;--verbose&#39;, default=False, is_flag=True
+)
+@click.option(
+    &#39;--n-dim&#39;, default=2
+)
+@click.command()
+def main(max_iter, verbose, n_dim):
+    exp = Dict({
+        &quot;domain_info&quot;: {
+            &quot;dim&quot;: n_dim,
+            &quot;domain_bounds&quot;: []
+        },
+        &quot;gp_historical_info&quot;: {
+            &quot;points_sampled&quot;: [],
+        },
+        &quot;num_to_sample&quot;: 1,
+    })
+    for _ in range(n_dim):
+        exp.domain_info.domain_bounds.append(
+            {&quot;max&quot;: 20.0, &quot;min&quot;: -20.0})
+    best_point = None
+    best_val = None
+
+    print(&#39;iter,ndim,query_msecs&#39;)
+
+    for iter in range(max_iter):
+        if verbose:
+            print(json.dumps(exp))
+        start = time.time()
+        r = requests.post(API, data=json.dumps(exp))
+        query_msecs = (time.time() - start) * 1000
+
+        if verbose:
+            print(r.text)
+        nextpt = [float(i)
+                  for i in json.loads(
+                          r.text)[&#39;points_to_sample&#39;][0]]
+        val = true_fn(nextpt)
+
+        if best_point is None or val &lt; best_val:
+            best_point = nextpt
+            best_val = val
+
+        print(&#39;{},{},{}&#39;.format(
+            iter,
+            n_dim,
+            query_msecs))
+
+        exp.gp_historical_info.points_sampled.append({
+            &quot;value_var&quot;: 0.01,
+            &quot;value&quot;: val,
+            &quot;point&quot;: nextpt,
+        })
+
+
+if __name__ == &#39;__main__&#39;:
+    main()</code></pre>
+</div>
+</div>
